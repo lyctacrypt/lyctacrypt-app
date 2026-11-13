@@ -20,7 +20,7 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
-            libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev libgtk-3-dev \n            libxdo-dev libayatana-appindicator3-dev libv4l-dev libclang-dev
+            libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libv4l-dev libclang-dev
       - name: Two independent builds
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
