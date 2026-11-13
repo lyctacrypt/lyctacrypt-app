@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = ["crates/lycta-core", "crates/lycta-node", "crates/lycta-gui"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/lyctacrypt/LyctaCrypt-App"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ml-kem = "0.2.1"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+sha3 = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1.8", features = ["derive", "serde"] }
+subtle = "2.6"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+ciborium = "0.2"
+serde_bytes = "0.11"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+data-encoding = "2.6"
+thiserror = "1"
+arti-client = { version = "0.48", default-features = false, features = [
+    "tokio", "rustls", "compression", "static-sqlite",
+    "onion-service-client", "onion-service-service",
+    "experimental-api", "keymgr", "ephemeral-keystore", "restricted-discovery",
+    "vanguards", "bridge-client", "pt-client", "hs-pow-full",
+] }
+tor-hsservice = { version = "0.48", features = ["restricted-discovery", "hs-pow-full"] }
+tor-hscrypto = "0.48"
+tor-llcrypto = "0.48"
+tor-config = "0.48"
+tor-keymgr = { version = "0.48", features = ["ephemeral-keystore"] }
+tor-guardmgr = { version = "0.48", features = ["vanguards"] }
+tor-cell = "0.48"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+libc = "0.2"
+windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Debug"] }
+tor-rtcompat = { version = "0.48", default-features = false, features = ["tokio", "rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "signal"] }
+futures = "0.3"
+rpassword = "7"
+dirs = "5"
+anyhow = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3

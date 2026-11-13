@@ -1,0 +1,38 @@
+[package]
+name = "lycta-gui"
+description = "LyctaCrypt: desktop app (egui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "lyctacrypt-gui"
+path = "src/main.rs"
+
+[dependencies]
+lycta-core = { path = "../lycta-core" }
+lycta-node = { path = "../lycta-node" }
+eframe = "0.31"
+tokio.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+zeroize.workspace = true
+lycta-sha3 = { package = "sha3", version = "0.10" }
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+nokhwa = { version = "0.10", features = ["input-native"] }
+rqrr = { version = "0.9", default-features = false }
+cpal = "0.15"
+rodio = { version = "0.20", default-features = false, features = ["wav"] }
+serde = { workspace = true }
+serde_json = "1"
+tray-icon = "0.19"
+notify-rust = "4"
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[features]
+demo = []

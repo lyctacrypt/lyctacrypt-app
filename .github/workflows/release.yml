@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev libgtk-3-dev \n            libxdo-dev libayatana-appindicator3-dev libv4l-dev libclang-dev
+      - name: Two independent builds
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          for d in /tmp/b1 /tmp/b2; do
+            rm -rf "$d" && mkdir -p "$d" && cp -r . "$d/src"
+            ( cd "$d/src" && \
+              RUSTFLAGS="--remap-path-prefix=$d/src=/build --remap-path-prefix=$HOME/.cargo=/cargo -C link-arg=-Wl,--build-id=none -C strip=symbols" \
+              cargo build --release --locked -p lycta-node -p lycta-gui )
+          done
+          for bin in lyctacrypt lyctacrypt-gui; do
+            a=$(sha256sum /tmp/b1/src/target/release/$bin | cut -d' ' -f1)
+            b=$(sha256sum /tmp/b2/src/target/release/$bin | cut -d' ' -f1)
+            echo "$bin: $a / $b"
+            test "$a" = "$b" || { echo "::error::$bin is not reproducible"; exit 1; }
+          done
+          mkdir -p dist
+          cp /tmp/b1/src/target/release/lyctacrypt dist/lyctacrypt-linux-x86_64
+          cp /tmp/b1/src/target/release/lyctacrypt-gui dist/lyctacrypt-gui-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: dist/* }
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: bash
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          RUSTFLAGS="--remap-path-prefix=$(pwd)=/build -C link-arg=/Brepro" \
+            cargo build --release --locked -p lycta-node -p lycta-gui
+          mkdir -p dist
+          cp target/release/lyctacrypt.exe dist/lyctacrypt-windows-x86_64.exe
+          cp target/release/lyctacrypt-gui.exe dist/lyctacrypt-gui-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: dist/* }
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          RUSTFLAGS="--remap-path-prefix=$(pwd)=/build" cargo build --release --locked -p lycta-node -p lycta-gui
+          mkdir -p dist
+          cp target/release/lyctacrypt dist/lyctacrypt-macos-arm64
+          cp target/release/lyctacrypt-gui dist/lyctacrypt-gui-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with: { name: macos, path: dist/* }
+
+  publish:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: minisign signature
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        working-directory: dist
+        run: |
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s /tmp/minisign.key -m SHA256SUMS
+          shred -u /tmp/minisign.key
+      - name: Provenance attestation (Sigstore)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --notes "Verify with scripts/verify-release.sh"
