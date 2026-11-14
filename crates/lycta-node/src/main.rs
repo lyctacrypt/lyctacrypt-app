@@ -128,6 +128,10 @@ fn new_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
     Ok(p1)
 }
 
+fn create_vault_key(pass: &[u8]) -> Result<VaultKey> {
+    Ok(VaultKey::create_with_device_fallback(pass)?)
+}
+
 fn unlock(path: &Path, restore: Option<&Path>) -> Result<(State, VaultKey)> {
     if let Some(backup) = restore {
         if path.exists() {
@@ -137,14 +141,20 @@ fn unlock(path: &Path, restore: Option<&Path>) -> Result<(State, VaultKey)> {
         let (mut state, _) = vault::load(backup, bp.as_bytes()).context("reading backup")?;
         state.prepare_restore();
         let p = new_passphrase("New passphrase: ")?;
-        return Ok((state, VaultKey::create(p.as_bytes())?));
+        return Ok((state, create_vault_key(p.as_bytes())?));
     }
     if path.exists() {
         let pass = Zeroizing::new(rpassword::prompt_password("Passphrase: ")?);
-        Ok(vault::load(path, pass.as_bytes())?)
+        let (state, vk) = vault::load(path, pass.as_bytes())?;
+        let vk = {
+            let mut vk = vk;
+            vk.bind_to_device_with_fallback()?;
+            vk
+        };
+        Ok((state, vk))
     } else {
         let p = new_passphrase("New passphrase: ")?;
-        Ok((State::new(), VaultKey::create(p.as_bytes())?))
+        Ok((State::new(), create_vault_key(p.as_bytes())?))
     }
 }
 
@@ -172,16 +182,23 @@ fn maintainer_command() -> Result<bool> {
         Some("update-keygen") => {
             let (secret, public) = update::keygen();
             println!("Secret key (keep offline, never commit it):\n{secret}\n");
-            println!("Public key (paste into UPDATE_PUBLIC_KEY in update.rs):\n{public}");
+            println!("Public key (set LYCTA_UPDATE_PUBLIC_KEY when building):\n{public}");
             Ok(true)
         }
         Some("update-sign") => {
-            let (Some(manifest), Some(key)) = (args.get(1), args.get(2)) else {
-                bail!("lyctacrypt update-sign <update.json> <secret-key-file>");
+            let Some(manifest) = args.get(1) else {
+                bail!("lyctacrypt update-sign <update.json> [secret-key-file]");
             };
             let bytes = std::fs::read(manifest)?;
-            let secret = Zeroizing::new(std::fs::read_to_string(key)?);
+            let secret = Zeroizing::new(match args.get(2) {
+                Some(key) => std::fs::read_to_string(key)?,
+                None => std::env::var("LYCTA_UPDATE_SECRET_KEY").map_err(|_| {
+                    anyhow!("secret-key file or LYCTA_UPDATE_SECRET_KEY is required")
+                })?,
+            });
             let sig = update::sign(&bytes, &secret)?;
+            update::verify_manifest(&bytes, &sig, update::UPDATE_PUBLIC_KEY)
+                .context("secret key does not match the compiled release public key")?;
             let out = format!("{manifest}.sig");
             std::fs::write(&out, &sig)?;
             println!("Signature written to {out}");
@@ -210,6 +227,10 @@ async fn main() -> Result<()> {
     let vault_path = lycta_node::vault_path(&args.data_dir);
 
     let (state, vk) = unlock(&vault_path, args.restore.as_deref())?;
+    #[cfg(windows)]
+    if !vk.is_device_bound() {
+        eprintln!("Warning: TPM unavailable; the vault is protected by its passphrase only.");
+    }
     vault::save(&vault_path, &state, &vk)?;
 
     if args.sandbox {
@@ -725,6 +746,7 @@ async fn handle(node: &Arc<Node>, current: &mut Option<Target>, line: &str) -> R
                 Some("off") => CoverMode::Off,
                 Some("low") => CoverMode::Low,
                 Some("high") => CoverMode::High,
+                Some("very-high") => CoverMode::VeryHigh,
                 _ => bail!("/cover off|low|high"),
             };
             node.state(|st| st.cover = mode);

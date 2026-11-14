@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lycta-core", "crates/lycta-node", "crates/lycta-gui"]
+members = ["crates/lycta-core", "crates/lycta-node", "crates/lycta-gui", "crates/lycta-tpm"]
 exclude = ["fuzz"]
 
 [workspace.package]

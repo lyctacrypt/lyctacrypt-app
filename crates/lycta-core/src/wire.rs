@@ -59,9 +59,11 @@ pub fn decode_frame(padded: &[u8]) -> Result<Frame> {
         return Err(Error::Malformed);
     }
     let n = u32::from_be_bytes(padded[..4].try_into().expect("4 bytes")) as usize;
-    let body = padded
-        .get(4..4usize.checked_add(n).ok_or(Error::Malformed)?)
-        .ok_or(Error::Malformed)?;
+    let body_end = 4usize.checked_add(n).ok_or(Error::Malformed)?;
+    let body = padded.get(4..body_end).ok_or(Error::Malformed)?;
+    if padded[body_end..].iter().any(|&byte| byte != 0) {
+        return Err(Error::Malformed);
+    }
     Ok(bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .allow_trailing_bytes()

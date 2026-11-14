@@ -10,6 +10,8 @@ pub enum Error {
     BadInvite,
     #[error("wrong passphrase or corrupted vault")]
     VaultDecrypt,
+    #[error("this vault requires its original TPM-bound key")]
+    DeviceBoundVault,
     #[error("too many skipped messages")]
     TooManySkipped,
     #[error("no sending chain yet")]

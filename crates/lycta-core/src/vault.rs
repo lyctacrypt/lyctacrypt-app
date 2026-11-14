@@ -74,6 +74,7 @@ pub enum CoverMode {
     Low,
 
     High,
+    VeryHigh,
 }
 
 impl CoverMode {
@@ -82,6 +83,7 @@ impl CoverMode {
             CoverMode::Off => None,
             CoverMode::Low => Some(120.0),
             CoverMode::High => Some(20.0),
+            CoverMode::VeryHigh => Some(5.0),
         }
     }
 }
@@ -218,6 +220,8 @@ pub struct Contact {
 
     #[serde(default)]
     pub own_device: bool,
+    #[serde(default)]
+    pub verified_fingerprint: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -811,6 +815,7 @@ impl State {
             mailbox: None,
             history: Vec::new(),
             own_device: false,
+            verified_fingerprint: None,
         });
         local_id
     }
@@ -909,6 +914,7 @@ fn derive_key(pass: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
 }
 
 const MAGIC_V3: &[u8; 8] = b"LYCTA\x00v3";
+const DEVICE_MAGIC: &[u8; 9] = b"LYCTA\x00tpm";
 
 pub const MAX_SLOTS: usize = 6;
 
@@ -919,6 +925,7 @@ pub struct VaultKey {
     index: usize,
 
     slots: Vec<Vec<u8>>,
+    device_key: Option<String>,
 }
 
 impl std::fmt::Debug for VaultKey {
@@ -953,7 +960,34 @@ impl VaultKey {
             key,
             index,
             slots,
+            device_key: None,
         })
+    }
+
+    pub fn create_with_device_fallback(pass: &[u8]) -> Result<Self> {
+        let mut vault_key = Self::create(pass)?;
+        vault_key.bind_to_device_with_fallback()?;
+        Ok(vault_key)
+    }
+
+    pub fn bind_to_device_with_fallback(&mut self) -> Result<bool> {
+        if self.device_key.is_some() {
+            return Ok(true);
+        }
+        let id = random_bytes::<16>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let name = format!("LyctaCryptVault-{id}");
+        if lycta_tpm::create_rsa_key(&name).is_err() {
+            return Ok(false);
+        }
+        self.device_key = Some(name);
+        Ok(true)
+    }
+
+    pub fn is_device_bound(&self) -> bool {
+        self.device_key.is_some()
     }
 
     pub fn slots_snapshot(&self) -> Vec<Vec<u8>> {
@@ -1068,6 +1102,7 @@ fn open_v2(bytes: &[u8], pass: &[u8]) -> Result<(State, VaultKey)> {
             key,
             index,
             slots,
+            device_key: None,
         },
     ))
 }
@@ -1092,6 +1127,7 @@ pub fn open_state(bytes: &[u8], pass: &[u8]) -> Result<(State, VaultKey)> {
                 key,
                 index,
                 slots,
+                device_key: None,
             },
         )),
         None => Err(Error::VaultDecrypt),
@@ -1110,6 +1146,10 @@ pub fn seal_new_slot(state: &State, pass: &[u8]) -> Result<Vec<u8>> {
 
 pub fn save(path: &Path, state: &State, vk: &VaultKey) -> Result<()> {
     let data = seal_state(state, vk)?;
+    let data = match &vk.device_key {
+        Some(name) => seal_for_device(name, &data)?,
+        None => data,
+    };
     let tmp = path.with_extension("tmp");
     {
         let mut f = fs::File::create(&tmp)?;
@@ -1122,12 +1162,90 @@ pub fn save(path: &Path, state: &State, vk: &VaultKey) -> Result<()> {
 
 pub fn backup(path: &Path, state: &State, backup_pass: &[u8]) -> Result<()> {
     let vk = VaultKey::create(backup_pass)?;
-    save(path, state, &vk)
+    save(path, state, &vk)?;
+    let (restored, _) = load(path, backup_pass)?;
+    if restored.identity.public().fingerprint() != state.identity.public().fingerprint() {
+        return Err(Error::Malformed);
+    }
+    Ok(())
 }
 
 pub fn load(path: &Path, pass: &[u8]) -> Result<(State, VaultKey)> {
     let data = Zeroizing::new(fs::read(path)?);
-    open_state(&data, pass)
+    if data.starts_with(DEVICE_MAGIC) {
+        let (inner, name) = open_for_device(&data)?;
+        let (state, mut vk) = open_state(&inner, pass)?;
+        vk.device_key = Some(name);
+        Ok((state, vk))
+    } else {
+        open_state(&data, pass)
+    }
+}
+
+fn seal_for_device(name: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+    let name_bytes = name.as_bytes();
+    if name_bytes.is_empty() || name_bytes.len() > 128 {
+        return Err(Error::Malformed);
+    }
+    let key = Zeroizing::new(random_bytes::<32>());
+    let wrapped_key = lycta_tpm::encrypt(name, &*key).map_err(|_| Error::Crypto)?;
+    if wrapped_key.is_empty() || wrapped_key.len() > u16::MAX as usize {
+        return Err(Error::Malformed);
+    }
+    let mut header =
+        Vec::with_capacity(DEVICE_MAGIC.len() + 4 + name_bytes.len() + wrapped_key.len());
+    header.extend_from_slice(DEVICE_MAGIC);
+    header.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+    header.extend_from_slice(&(wrapped_key.len() as u16).to_be_bytes());
+    header.extend_from_slice(name_bytes);
+    header.extend_from_slice(&wrapped_key);
+    let ciphertext = seal(&key, &header, plaintext);
+    header.extend_from_slice(&ciphertext);
+    Ok(header)
+}
+
+fn open_for_device(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, String)> {
+    let lengths = bytes
+        .get(DEVICE_MAGIC.len()..DEVICE_MAGIC.len() + 4)
+        .ok_or(Error::VaultDecrypt)?;
+    let name_len = u16::from_be_bytes([lengths[0], lengths[1]]) as usize;
+    let wrapped_len = u16::from_be_bytes([lengths[2], lengths[3]]) as usize;
+    if name_len == 0 || name_len > 128 || wrapped_len == 0 || wrapped_len > 4096 {
+        return Err(Error::VaultDecrypt);
+    }
+    let name_start = DEVICE_MAGIC.len() + 4;
+    let wrapped_start = name_start
+        .checked_add(name_len)
+        .ok_or(Error::VaultDecrypt)?;
+    let cipher_start = wrapped_start
+        .checked_add(wrapped_len)
+        .ok_or(Error::VaultDecrypt)?;
+    let name = std::str::from_utf8(
+        bytes
+            .get(name_start..wrapped_start)
+            .ok_or(Error::VaultDecrypt)?,
+    )
+    .map_err(|_| Error::VaultDecrypt)?;
+    let Some(id) = name.strip_prefix("LyctaCryptVault-") else {
+        return Err(Error::VaultDecrypt);
+    };
+    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) || wrapped_len != 256 {
+        return Err(Error::VaultDecrypt);
+    }
+    let wrapped = bytes
+        .get(wrapped_start..cipher_start)
+        .ok_or(Error::VaultDecrypt)?;
+    let encrypted = bytes.get(cipher_start..).ok_or(Error::VaultDecrypt)?;
+    let unwrapped =
+        Zeroizing::new(lycta_tpm::decrypt(name, wrapped).map_err(|_| Error::DeviceBoundVault)?);
+    if unwrapped.len() != 32 {
+        return Err(Error::VaultDecrypt);
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&unwrapped);
+    let plaintext =
+        open(&key, &bytes[..cipher_start], encrypted).map_err(|_| Error::VaultDecrypt)?;
+    Ok((plaintext, name.to_owned()))
 }
 
 #[cfg(test)]

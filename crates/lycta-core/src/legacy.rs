@@ -103,6 +103,7 @@ impl From<LegacyState> for State {
                 mailbox: c.mailbox,
                 history: c.history.into_iter().map(HistoryEntry::from).collect(),
                 own_device: false,
+                verified_fingerprint: None,
             })
             .collect();
         st.slots = l.slots;

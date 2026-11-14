@@ -39,6 +39,10 @@ in the middle and no server holding your conversations.
 - **Locked on your device.** Everything is kept in one encrypted file, opened with your
   passphrase.
 
+On Windows, local vaults are additionally bound to a non-exportable key stored by the TPM when
+one is available. Without a TPM, the app warns and uses the passphrase alone. A TPM-bound vault
+file cannot be opened on another PC; use an exported backup to move your data.
+
 ## What you can do
 
 - Send messages, pictures, files and voice notes

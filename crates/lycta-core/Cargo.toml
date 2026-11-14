@@ -26,3 +26,4 @@ serde_bytes.workspace = true
 ed25519-dalek.workspace = true
 data-encoding.workspace = true
 thiserror.workspace = true
+lycta-tpm = { path = "../lycta-tpm" }

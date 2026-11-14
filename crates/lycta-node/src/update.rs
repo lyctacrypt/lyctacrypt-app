@@ -9,7 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::tor::Client;
 
-pub const UPDATE_PUBLIC_KEY: &str = "";
+pub const UPDATE_PUBLIC_KEY: &str = match option_env!("LYCTA_UPDATE_PUBLIC_KEY") {
+    Some(value) => value,
+    None => "cbb501b0c12e7c367cfccbcc90005c673907956d9348897f4cec5887242a67bc",
+};
 
 pub const UPDATE_MANIFEST_URL: &str =
     "https://github.com/lyctacrypt/LyctaCrypt-App/releases/latest/download/update.json";
@@ -22,6 +25,8 @@ const MAX_REDIRECTS: usize = 5;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
     pub version: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
     #[serde(default)]
     pub notes: String,
     pub assets: Vec<Asset>,
@@ -38,7 +43,7 @@ pub struct Asset {
 }
 
 pub fn enabled() -> bool {
-    !UPDATE_PUBLIC_KEY.is_empty()
+    !UPDATE_PUBLIC_KEY.trim().is_empty()
 }
 
 pub fn current_target() -> String {
@@ -89,7 +94,30 @@ pub fn verify_manifest(manifest: &[u8], sig_hex: &str, public_key_hex: &str) -> 
     if parse_version(&m.version).is_none() {
         bail!("malformed version in update manifest");
     }
+    validate_manifest_time(&m, unix_time()?)?;
     Ok(m)
+}
+
+fn unix_time() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs())
+}
+
+fn validate_manifest_time(m: &Manifest, now: u64) -> Result<()> {
+    const CLOCK_SKEW: u64 = 300;
+    const MAX_VALIDITY: u64 = 90 * 24 * 60 * 60;
+    if m.issued_at > now.saturating_add(CLOCK_SKEW) {
+        bail!("update manifest timestamp is in the future");
+    }
+    if m.expires_at <= now {
+        bail!("update manifest has expired");
+    }
+    if m.expires_at <= m.issued_at || m.expires_at.saturating_sub(m.issued_at) > MAX_VALIDITY {
+        bail!("invalid update manifest validity period");
+    }
+    Ok(())
 }
 
 pub fn keygen() -> (String, String) {
@@ -105,7 +133,8 @@ pub fn sign(manifest: &[u8], secret_hex: &str) -> Result<String> {
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| anyhow!("invalid secret key"))?;
 
-    serde_json::from_slice::<Manifest>(manifest).context("manifest is not valid")?;
+    let parsed: Manifest = serde_json::from_slice(manifest).context("manifest is not valid")?;
+    validate_manifest_time(&parsed, unix_time()?)?;
     let sig = SigningKey::from_bytes(&seed).sign(&signed_bytes(manifest));
     Ok(HEX.encode(&sig.to_bytes()))
 }
@@ -226,7 +255,7 @@ pub async fn https_get(client: &Client, url: &str, max: usize) -> Result<Vec<u8>
             .map_err(|_| anyhow!("invalid update address"))?;
         let mut tls = connector.connect(name, stream).await?;
         let req = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: lyctacrypt\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
             u.path, u.host
         );
         tls.write_all(req.as_bytes()).await?;
@@ -339,7 +368,8 @@ mod tests {
     use super::*;
 
     fn manifest() -> Vec<u8> {
-        br#"{"version":"0.2.0","notes":"fixes","assets":[{"target":"windows-x86_64","name":"lyctacrypt-gui","url":"https://example.org/a.exe","sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","size":3}]}"#.to_vec()
+        let now = unix_time().unwrap();
+        format!(r#"{{"version":"0.2.0","issued_at":{now},"expires_at":{},"notes":"fixes","assets":[{{"target":"windows-x86_64","name":"lyctacrypt-gui","url":"https://example.org/a.exe","sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","size":3}}]}}"#, now + 86400).into_bytes()
     }
 
     #[test]

@@ -94,6 +94,8 @@ fn main() -> eframe::Result<()> {
 enum Msg {
     Ready(Arc<Node>, UnboundedReceiver<Event>),
     Failed(String),
+    DeviceProtectionUnavailable,
+    UnlockRejected,
     Info(String),
     Silent,
     Invite(String),
@@ -284,6 +286,8 @@ struct App {
     pass2: Zeroizing<String>,
     show_pass: bool,
     unlock_error: Option<String>,
+    failed_unlocks: u32,
+    unlock_allowed_at: Option<Instant>,
 
     target: Option<Target>,
     input: String,
@@ -469,6 +473,8 @@ impl App {
             pass2: Zeroizing::new(String::new()),
             show_pass: false,
             unlock_error: None,
+            failed_unlocks: 0,
+            unlock_allowed_at: None,
             target: None,
             input: String::new(),
             compose: None,
@@ -648,6 +654,12 @@ impl App {
     }
 
     fn unlock(&mut self) {
+        if self
+            .unlock_allowed_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return;
+        }
         let exists = self.vault_path().exists();
         if !exists {
             if *self.pass != *self.pass2 {
@@ -674,13 +686,24 @@ impl App {
                 let (state, vk) =
                     tokio::task::spawn_blocking(move || -> anyhow::Result<(State, VaultKey)> {
                         if exists {
-                            Ok(vault::load(&p, &pass)?)
+                            let (state, vk) = vault::load(&p, &pass)?;
+                            let vk = {
+                                let mut vk = vk;
+                                vk.bind_to_device_with_fallback()?;
+                                vk
+                            };
+                            Ok((state, vk))
                         } else {
-                            Ok((State::new(), VaultKey::create(&pass)?))
+                            let vk = VaultKey::create_with_device_fallback(&pass)?;
+                            Ok((State::new(), vk))
                         }
                     })
                     .await??;
                 vault::save(&path, &state, &vk)?;
+                #[cfg(windows)]
+                if !vk.is_device_bound() {
+                    let _ = tx.send(Msg::DeviceProtectionUnavailable);
+                }
                 let client = tor::bootstrap(&dir, &TorOptions::load_files(&dir)?).await?;
                 let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
                 let node = Node::new(state, vk, path, client, etx);
@@ -688,7 +711,17 @@ impl App {
                 Ok(Msg::Ready(node, erx))
             }
             .await;
-            let _ = tx.send(r.unwrap_or_else(|e| Msg::Failed(format!("{e:#}"))));
+            let msg = match r {
+                Ok(msg) => msg,
+                Err(e)
+                    if e.downcast_ref::<lycta_core::Error>()
+                        .is_some_and(|e| matches!(e, lycta_core::Error::VaultDecrypt)) =>
+                {
+                    Msg::UnlockRejected
+                }
+                Err(e) => Msg::Failed(format!("{e:#}")),
+            };
+            let _ = tx.send(msg);
         });
     }
 
@@ -705,6 +738,8 @@ impl App {
             }
             match m {
                 Msg::Ready(node, events) => {
+                    self.failed_unlocks = 0;
+                    self.unlock_allowed_at = None;
                     self.node = Some(node);
                     self.events = Some(events);
                     self.screen = Screen::Main;
@@ -719,6 +754,18 @@ impl App {
                     } else {
                         self.toast(Tone::Warn, e);
                     }
+                }
+                Msg::DeviceProtectionUnavailable => self.toast(
+                    Tone::Warn,
+                    "TPM unavailable: this vault is protected by its passphrase only.",
+                ),
+                Msg::UnlockRejected => {
+                    self.failed_unlocks = self.failed_unlocks.saturating_add(1);
+                    let exponent = self.failed_unlocks.saturating_sub(1).min(6);
+                    let delay = (1u64 << exponent).min(60);
+                    self.unlock_allowed_at = Some(Instant::now() + Duration::from_secs(delay));
+                    self.unlock_error = Some("Incorrect passphrase or damaged vault.".into());
+                    self.screen = Screen::Unlock;
                 }
                 Msg::Info(s) => self.toast(Tone::Ok, s),
                 Msg::Silent => {}
@@ -815,6 +862,15 @@ impl App {
 
     fn ui_unlock(&mut self, ctx: &egui::Context) {
         let exists = self.vault_path().exists();
+        let remaining = self
+            .unlock_allowed_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .filter(|remaining| !remaining.is_zero());
+        if remaining.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        } else {
+            self.unlock_allowed_at = None;
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space((ui.available_height() * 0.2).max(20.0));
@@ -855,8 +911,20 @@ impl App {
                     ui.checkbox(&mut self.show_pass, "Show");
                     ui.add_space(4.0);
                     let label = if exists { "Unlock" } else { "Create vault" };
-                    if theme::primary_button(ui, label).clicked() || submit {
+                    let unlock_button = ui
+                        .add_enabled_ui(remaining.is_none(), |ui| theme::primary_button(ui, label))
+                        .inner;
+                    if unlock_button.clicked() || (submit && remaining.is_none()) {
                         self.unlock();
+                    }
+                    if let Some(remaining) = remaining {
+                        ui.add_space(4.0);
+                        ui.label(format!(
+                            "Too many attempts. Try again in {} seconds.",
+                            remaining
+                                .as_secs()
+                                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                        ));
                     }
                     if let Some(e) = &self.unlock_error {
                         ui.add_space(4.0);
@@ -1467,6 +1535,7 @@ impl App {
                 let hist = contact_rows(ct);
                 (
                     ct.public.fingerprint(),
+                    ct.verified_fingerprint,
                     ct.note.clone(),
                     ct.accepted,
                     ct.blocked,
@@ -1477,7 +1546,17 @@ impl App {
                 )
             })
         });
-        let Some((fp, note, accepted, blocked, timer, has_mailbox, has_session, hist)) = info
+        let Some((
+            fp,
+            verified_fingerprint,
+            note,
+            accepted,
+            blocked,
+            timer,
+            has_mailbox,
+            has_session,
+            hist,
+        )) = info
         else {
             self.target = None;
             return;
@@ -1505,6 +1584,18 @@ impl App {
                     "⏳ No session"
                 }
                 .to_string()];
+                if let Some(verified) = verified_fingerprint {
+                    tags.push(
+                        if verified == fp {
+                            "✓ Key verified"
+                        } else {
+                            "⚠ Key changed — verify"
+                        }
+                        .into(),
+                    );
+                } else {
+                    tags.push("Key not verified".into());
+                }
                 if let Some(t) = timer {
                     tags.push(format!("⏱ {}", human_duration(t)));
                 }
@@ -2228,6 +2319,17 @@ impl App {
                     match self.verify_result {
                         Some(true) => {
                             ui.label(RichText::new("✔ Codes match").strong().color(Palette::OK));
+                            if ui.button("Trust this key").clicked() {
+                                node.state(|st| {
+                                    if let Some(contact) =
+                                        st.contacts.iter_mut().find(|x| x.local_id == c)
+                                    {
+                                        contact.verified_fingerprint = Some(fp);
+                                    }
+                                });
+                                let _ = node.save();
+                                self.verify = None;
+                            }
                         }
                         Some(false) => {
                             ui.label(
@@ -2337,6 +2439,7 @@ impl App {
                     ui.radio_value(&mut cover, CoverMode::Off, "Off");
                     ui.radio_value(&mut cover, CoverMode::Low, "Low");
                     ui.radio_value(&mut cover, CoverMode::High, "High");
+                    ui.radio_value(&mut cover, CoverMode::VeryHigh, "Very high (more traffic)");
                 });
                 if cover != before {
                     node.state(|st| st.cover = cover);

@@ -14,6 +14,14 @@
 - **Timing and volume.** Fixed-size padding, encrypted headers and cover traffic.
 - **Data at rest.** One encrypted vault holds everything, onion keys included. The Tor keystore
   stays in memory.
+- **Windows device binding.** When available, the local vault is additionally wrapped by a key
+  protected by the Microsoft Platform Crypto Provider (TPM). This is an app-specific,
+  non-exportable key, not the EK itself. It prevents a copied vault file from opening on a
+  different TPM. Without a usable TPM the app warns and uses passphrase protection alone.
+  Clearing or replacing a TPM loses access to its bound local file; use a separate exported
+  backup to migrate. This does not protect an already-unlocked device from malware or a
+  compromised operating system. Linux and macOS use passphrase protection without this hardware
+  layer.
 - **"Harvest now, decrypt later".** ML-KEM-768 protects recorded exchanges.
 
 ## What has been checked
@@ -28,9 +36,10 @@
 - Manual runs: HTTPS download through Tor with redirects (the update transport), connection
   through a Tor Browser obfs4 bridge, reading the bridge list of a real Tor Browser.
 - `cargo fmt`, `cargo clippy -D warnings` and the tests pass.
-- **Not tried with real hardware:** microphone recording, audio playback and webcam scanning
-  (QR decoding and WAV encoding are tested, the devices are not), Snowflake bridges, actually
-  installing an update (no signed release exists yet), clicking the tray menu.
+- **Not tried with real hardware:** TPM key creation and recovery, microphone recording, audio
+  playback and webcam scanning (QR decoding and WAV encoding are tested, the devices are not),
+  Snowflake bridges, actually installing an update (no signed release exists yet), clicking the
+  tray menu.
 - **Not run yet** (CI will run them on the first push): long fuzzing (`fuzz/`), ProVerif
   (`formal/`), cargo-deny, Linux build and sandbox, macOS build, bit-for-bit reproducibility.
 
@@ -120,3 +129,7 @@
 Please do not publish details in a public issue. Contact the maintainers privately (address to
 be set when the repository is published) with a description and, if possible, a proof of
 concept.
+
+## New protections and remaining limitations
+
+Contact fingerprints can be pinned after matching safety codes; a later key change blocks outgoing messages until re-verification. Cover traffic has a five-second mean interval setting, which raises traffic volume and does not defeat timing correlation. JPEG application/comment segments, PNG ancillary chunks, WAV non-audio chunks, and WebP chunks outside the supported image/animation set are removed on send; unknown formats are refused. Update requests omit an application-specific User-Agent. Signed update manifests must have valid, signed issue and expiry timestamps; verification rejects expired manifests and validity periods longer than 90 days. Group roster changes are not yet protected by a cryptographic all-member approval quorum. See [docs/PQ_AUTH_REVIEW.md](docs/PQ_AUTH_REVIEW.md): ML-KEM helps confidentiality, while current identity authentication still relies on X25519 and is not post-quantum.

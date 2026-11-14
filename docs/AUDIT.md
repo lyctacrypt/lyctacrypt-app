@@ -83,10 +83,18 @@ installed, the Sigstore provenance attestation.
 
 ## Publishing an update (maintainers)
 
-1. Once: run `lyctacrypt update-keygen`. Keep the secret key **offline**. Paste the public key
-   into `UPDATE_PUBLIC_KEY` (`crates/lycta-node/src/update.rs`) and set `UPDATE_MANIFEST_URL`.
-2. For each version: write `update.json` with, for each program, its target
+1. This checkout contains a generated release public key as its default. To rotate it, run
+   `lyctacrypt update-keygen`, keep the secret key offline, and set the printed public key in
+   the build environment variable `LYCTA_UPDATE_PUBLIC_KEY`. In PowerShell, set
+   `$env:LYCTA_UPDATE_PUBLIC_KEY = '<public-key-hex>'` before running
+   `cargo build --release -p lycta-node -p lycta-gui`. Set `UPDATE_MANIFEST_URL` in
+   `crates/lycta-node/src/update.rs` if the release host differs from the default.
+2. For each version: write `update.json` with `version`, Unix-second `issued_at` and
+   `expires_at` timestamps (no more than 90 days apart), and for each program its target
    (`windows-x86_64`, `linux-x86_64`, `macos-aarch64`…), its name (`lyctacrypt` or
    `lyctacrypt-gui`), its HTTPS address, its SHA-256 and its size.
-3. `lyctacrypt update-sign update.json <secret key file>` produces `update.json.sig`.
+3. `lyctacrypt update-sign update.json <secret key file>` produces `update.json.sig`. On
+   Windows, the signer can instead read `LYCTA_UPDATE_SECRET_KEY` from the current process
+   environment. The command verifies that the signing key matches the public key embedded in
+   that build before it writes the signature.
 4. Attach both files to the release.

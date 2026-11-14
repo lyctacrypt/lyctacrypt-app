@@ -47,6 +47,175 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
+fn strip_image_metadata(data: Vec<u8>) -> Result<(Vec<u8>, Option<String>)> {
+    if data.starts_with(&[0xff, 0xd8]) {
+        let mut out = vec![0xff, 0xd8];
+        let mut pos = 2;
+        let mut changed = false;
+        while pos < data.len() {
+            if data[pos] != 0xff {
+                bail!("malformed JPEG marker");
+            }
+            let start = pos;
+            while pos < data.len() && data[pos] == 0xff {
+                pos += 1;
+            }
+            if pos >= data.len() {
+                bail!("truncated JPEG marker");
+            }
+            let marker = data[pos];
+            pos += 1;
+            if marker == 0xd9 || marker == 0xda {
+                out.extend_from_slice(&data[start..]);
+                return Ok((
+                    out,
+                    changed.then(|| "JPEG metadata removed before sending.".into()),
+                ));
+            }
+            if matches!(marker, 0x01 | 0xd0..=0xd7) {
+                out.extend_from_slice(&data[start..pos]);
+                continue;
+            }
+            if pos + 2 > data.len() {
+                bail!("truncated JPEG segment");
+            }
+            let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            if len < 2 || pos + len > data.len() {
+                bail!("invalid JPEG segment length");
+            }
+            let end = pos + len;
+            if matches!(marker, 0xe0..=0xef | 0xfe) {
+                changed = true;
+            } else {
+                out.extend_from_slice(&data[start..end]);
+            }
+            pos = end;
+        }
+        bail!("JPEG has no image data marker");
+    }
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if data.starts_with(PNG) {
+        let mut out = data[..8].to_vec();
+        let mut pos = 8;
+        let mut changed = false;
+        while pos + 12 <= data.len() {
+            let len = u32::from_be_bytes(data[pos..pos + 4].try_into()?) as usize;
+            let end = pos
+                .checked_add(12)
+                .and_then(|n| n.checked_add(len))
+                .filter(|&n| n <= data.len())
+                .ok_or_else(|| anyhow!("invalid PNG chunk length"))?;
+            let kind = &data[pos + 4..pos + 8];
+            if kind[0].is_ascii_lowercase()
+                && !matches!(kind, b"tRNS" | b"acTL" | b"fcTL" | b"fdAT")
+            {
+                changed = true;
+            } else {
+                out.extend_from_slice(&data[pos..end]);
+            }
+            pos = end;
+            if kind == b"IEND" {
+                if pos != data.len() {
+                    bail!("trailing data after PNG end");
+                }
+                return Ok((
+                    out,
+                    changed.then(|| "PNG metadata removed before sending.".into()),
+                ));
+            }
+        }
+        bail!("truncated PNG");
+    }
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WAVE" {
+        if u32::from_le_bytes(data[4..8].try_into()?) as usize != data.len() - 8 {
+            bail!("malformed WAV container length");
+        }
+        let mut out = data[..12].to_vec();
+        let mut pos = 12;
+        let mut changed = false;
+        let mut has_fmt = false;
+        let mut has_data = false;
+        while pos + 8 <= data.len() {
+            let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into()?) as usize;
+            let padded_size = size
+                .checked_add(size & 1)
+                .ok_or_else(|| anyhow!("invalid WAV chunk size"))?;
+            let end = pos
+                .checked_add(8)
+                .and_then(|n| n.checked_add(padded_size))
+                .filter(|&n| n <= data.len())
+                .ok_or_else(|| anyhow!("invalid WAV chunk size"))?;
+            let kind = &data[pos..pos + 4];
+            if matches!(kind, b"fmt " | b"data" | b"fact") {
+                has_fmt |= kind == b"fmt ";
+                has_data |= kind == b"data";
+                out.extend_from_slice(&data[pos..end]);
+            } else {
+                changed = true;
+            }
+            pos = end;
+        }
+        if pos != data.len() || !has_fmt || !has_data {
+            bail!("malformed WAV file");
+        }
+        let riff_size = u32::try_from(out.len() - 8).map_err(|_| anyhow!("WAV file too large"))?;
+        out[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        return Ok((
+            out,
+            changed.then(|| "WAV metadata removed before sending.".into()),
+        ));
+    }
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        if u32::from_le_bytes(data[4..8].try_into()?) as usize != data.len() - 8 {
+            bail!("malformed WebP container length");
+        }
+        let mut out = data[..12].to_vec();
+        let mut pos = 12;
+        let mut changed = false;
+        while pos + 8 <= data.len() {
+            let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into()?) as usize;
+            let padded_size = size
+                .checked_add(size & 1)
+                .ok_or_else(|| anyhow!("invalid WebP chunk size"))?;
+            let end = pos
+                .checked_add(8)
+                .and_then(|n| n.checked_add(padded_size))
+                .filter(|&n| n <= data.len())
+                .ok_or_else(|| anyhow!("invalid WebP chunk size"))?;
+            let kind = &data[pos..pos + 4];
+            if matches!(
+                kind,
+                b"VP8 " | b"VP8L" | b"VP8X" | b"ALPH" | b"ANIM" | b"ANMF"
+            ) {
+                if kind == b"VP8X" {
+                    if size != 10 {
+                        bail!("invalid WebP extended header");
+                    }
+                    changed |= data[pos + 8] & 0x2c != 0;
+                    let start = out.len();
+                    out.extend_from_slice(&data[pos..end]);
+                    out[start + 8] &= !0x2c;
+                } else {
+                    out.extend_from_slice(&data[pos..end]);
+                }
+            } else {
+                changed = true;
+            }
+            pos = end;
+        }
+        if pos != data.len() || out.len() < 20 {
+            bail!("malformed WebP file");
+        }
+        let riff_size = u32::try_from(out.len() - 8).map_err(|_| anyhow!("WebP file too large"))?;
+        out[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        return Ok((
+            out,
+            changed.then(|| "WebP metadata removed before sending.".into()),
+        ));
+    }
+    bail!("metadata cleanup is unavailable for this file format; sending was blocked")
+}
+
 use crate::tor::{self, Client, Incoming};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1459,6 +1628,15 @@ impl Node {
         contents: Vec<Content>,
         history: Option<HistoryEntry>,
     ) -> Result<()> {
+        let changed_key = self.with(|i| {
+            i.state.contact_by_local(contact).is_some_and(|c| {
+                c.verified_fingerprint
+                    .is_some_and(|verified| verified != c.public.fingerprint())
+            })
+        });
+        if changed_key {
+            bail!("contact identity key changed; verify the new safety code before sending");
+        }
         let need_hs = self.with(|i| {
             i.state
                 .contact_by_local(contact)
@@ -1694,10 +1872,14 @@ impl Node {
         name: &str,
         data: Vec<u8>,
     ) -> Result<()> {
-        let data = Zeroizing::new(data);
         if data.is_empty() {
             bail!("empty file");
         }
+        if data.len() > MAX_FILE {
+            bail!("file too large ({} bytes, max {MAX_FILE})", data.len());
+        }
+        let (data, metadata_action) = strip_image_metadata(data)?;
+        let data = Zeroizing::new(data);
         if data.len() > MAX_FILE {
             bail!("file too large ({} bytes, max {MAX_FILE})", data.len());
         }
@@ -1744,7 +1926,11 @@ impl Node {
                 })
             });
         }
-        self.queue_many(contact, contents, Some(entry)).await
+        self.queue_many(contact, contents, Some(entry)).await?;
+        if let Some(message) = metadata_action {
+            self.emit(Event::Info(message));
+        }
+        Ok(())
     }
 
     pub fn export_file(&self, file: u32, dest: &std::path::Path) -> Result<std::path::PathBuf> {
